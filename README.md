@@ -1,2 +1,1 @@
-# ResGrad-pytorch
-RESGRAD: RESIDUAL DENOISING DIFFUSION PROBABILISTIC MODELS FOR TEXT TO SPEECH
+# ResGrad: Residual Denoising Diffusion Probabilistic Models for Text to Speech
