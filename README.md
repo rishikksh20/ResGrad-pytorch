@@ -1,7 +1,7 @@
 # ResGrad: Residual Denoising Diffusion Probabilistic Models for Text to Speech
 
 ## Usages:
-```
+```python
 import torch
 from model import GradLogPEstimator2d
 from diffusion import GaussianDiffusion
@@ -18,4 +18,20 @@ estimator = GradLogPEstimator2d(dim, n_spks=n_spks,
   
 diff = GaussianDiffusion(estimator)
 
+
+mel_gt = torch.ones([2, 80, 100])
+mask = torch.zeros([2, 1, 100])
+mel_gen = torch.ones([2, 80, 100])
+t = torch.rand([2])
+
+x0 = mel_gt - mel_gen
+
+loss = diff(x0, mask, mel_gen)
+
+
+# Generate samples
+
+out = diff.sample(mask, mel_gen)
+
+mel_gen = mel_gen + out   # Final output mel send to the vocoder
 ```
