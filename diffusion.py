@@ -46,11 +46,9 @@ class GaussianDiffusion(torch.nn.Module):
     def __init__(
             self,
             model,
-            *,
-            image_size,
             timesteps=1000,
-            sampling_timesteps=None,
-            loss_type='l1',
+            sampling_timesteps=4,
+            loss_type='l2',
             objective='pred_noise',
             beta_schedule='linear',
             p2_loss_weight_gamma=0.,
@@ -66,7 +64,6 @@ class GaussianDiffusion(torch.nn.Module):
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
-        self.image_size = image_size
 
         self.objective = objective
 
@@ -211,7 +208,7 @@ class GaussianDiffusion(torch.nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             t = torch.full((batch,), time, device=device, dtype=torch.long)
-            mu = x_start if self.mu else None
+
             pred_noise, x_start = self.model_predictions(x, mask, mu, t, clip_x_start=clip_denoised)
 
             if time_next < 0:
