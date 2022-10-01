@@ -1,294 +1,298 @@
-# Copyright (C) 2021. Huawei Technologies Co., Ltd. All rights reserved.
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the MIT License.
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# MIT License for more details.
-
-import math
 import torch
-from einops import rearrange
+import math
+from einops import rearrange, reduce
+from tqdm.auto import tqdm
+from functools import partial
+import torch.nn.functional as F
 
-from model.base import BaseModule
+def exists(x):
+    return x is not None
 
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
 
-class Mish(BaseModule):
-    def forward(self, x):
-        return x * torch.tanh(torch.nn.functional.softplus(x))
+def identity(t, *args, **kwargs):
+    return t
 
+# gaussian diffusion trainer class
 
-class Upsample(BaseModule):
-    def __init__(self, dim):
-        super(Upsample, self).__init__()
-        self.conv = torch.nn.ConvTranspose2d(dim, dim, 4, 2, 1)
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-    def forward(self, x):
-        return self.conv(x)
+def linear_beta_schedule(timesteps):
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
-
-class Downsample(BaseModule):
-    def __init__(self, dim):
-        super(Downsample, self).__init__()
-        self.conv = torch.nn.Conv2d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Rezero(BaseModule):
-    def __init__(self, fn):
-        super(Rezero, self).__init__()
-        self.fn = fn
-        self.g = torch.nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        return self.fn(x) * self.g
-
-
-class Block(BaseModule):
-    def __init__(self, dim, dim_out, groups=8):
-        super(Block, self).__init__()
-        self.block = torch.nn.Sequential(torch.nn.Conv2d(dim, dim_out, 3, 
-                                         padding=1), torch.nn.GroupNorm(
-                                         groups, dim_out), Mish())
-
-    def forward(self, x, mask):
-        output = self.block(x * mask)
-        return output * mask
+def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
 
 
-class ResnetBlock(BaseModule):
-    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
-        super(ResnetBlock, self).__init__()
-        self.mlp = torch.nn.Sequential(Mish(), torch.nn.Linear(time_emb_dim, 
-                                                               dim_out))
+class GaussianDiffusion(torch.nn.Module):
+    def __init__(
+            self,
+            model,
+            *,
+            image_size,
+            timesteps=1000,
+            sampling_timesteps=None,
+            loss_type='l1',
+            objective='pred_noise',
+            beta_schedule='linear',
+            p2_loss_weight_gamma=0.,
+            # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+            p2_loss_weight_k=1,
+            ddim_sampling_eta=1.
+    ):
+        super().__init__()
+        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not model.learned_sinusoidal_cond
 
-        self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim_out, dim_out, groups=groups)
-        if dim != dim_out:
-            self.res_conv = torch.nn.Conv2d(dim, dim_out, 1)
+        self.model = model
+        self.channels = self.model.channels
+        self.self_condition = self.model.self_condition
+
+        self.image_size = image_size
+
+        self.objective = objective
+
+        assert objective in {'pred_noise',
+                             'pred_x0'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start)'
+
+        if beta_schedule == 'linear':
+            betas = linear_beta_schedule(timesteps)
+        elif beta_schedule == 'cosine':
+            betas = cosine_beta_schedule(timesteps)
         else:
-            self.res_conv = torch.nn.Identity()
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
 
-    def forward(self, x, mask, time_emb):
-        h = self.block1(x, mask)
-        h += self.mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
-        h = self.block2(h, mask)
-        output = h + self.res_conv(x * mask)
-        return output
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
 
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.loss_type = loss_type
 
-class LinearAttention(BaseModule):
-    def __init__(self, dim, heads=4, dim_head=32):
-        super(LinearAttention, self).__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = torch.nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = torch.nn.Conv2d(hidden_dim, dim, 1)            
+        # sampling related parameters
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x)
-        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', 
-                            heads = self.heads, qkv=3)            
-        k = k.softmax(dim=-1)
-        context = torch.einsum('bhdn,bhen->bhde', k, v)
-        out = torch.einsum('bhde,bhdn->bhen', context, q)
-        out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', 
-                        heads=self.heads, h=h, w=w)
-        return self.to_out(out)
+        self.sampling_timesteps = default(sampling_timesteps,
+                                          timesteps)  # default num sampling timesteps to number of timesteps at training
 
+        assert self.sampling_timesteps <= timesteps
+        self.is_ddim_sampling = self.sampling_timesteps < timesteps
+        self.ddim_sampling_eta = ddim_sampling_eta
 
-class Residual(BaseModule):
-    def __init__(self, fn):
-        super(Residual, self).__init__()
-        self.fn = fn
+        # helper function to register buffer from float64 to float32
 
-    def forward(self, x, *args, **kwargs):
-        output = self.fn(x, *args, **kwargs) + x
-        return output
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
-class SinusoidalPosEmb(BaseModule):
-    def __init__(self, dim):
-        super(SinusoidalPosEmb, self).__init__()
-        self.dim = dim
+        # calculations for diffusion q(x_t | x_{t-1}) and others
 
-    def forward(self, x, scale=1000):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
 
-class GradLogPEstimator2d(BaseModule):
-    def __init__(self, dim, dim_mults=(1, 2, 4), groups=8,
-                 n_spks=None, spk_emb_dim=64, n_feats=80, pe_scale=1000):
-        super(GradLogPEstimator2d, self).__init__()
-        self.dim = dim
-        self.dim_mults = dim_mults
-        self.groups = groups
-        self.n_spks = n_spks if not isinstance(n_spks, type(None)) else 1
-        self.spk_emb_dim = spk_emb_dim
-        self.pe_scale = pe_scale
-        
-        if n_spks > 1:
-            self.spk_mlp = torch.nn.Sequential(torch.nn.Linear(spk_emb_dim, spk_emb_dim * 4), Mish(),
-                                               torch.nn.Linear(spk_emb_dim * 4, n_feats))
-        self.time_pos_emb = SinusoidalPosEmb(dim)
-        self.mlp = torch.nn.Sequential(torch.nn.Linear(dim, dim * 4), Mish(),
-                                       torch.nn.Linear(dim * 4, dim))
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
-        dims = [2 + (1 if n_spks > 1 else 0), *map(lambda m: dim * m, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
-        self.downs = torch.nn.ModuleList([])
-        self.ups = torch.nn.ModuleList([])
-        num_resolutions = len(in_out)
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
 
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (num_resolutions - 1)
-            self.downs.append(torch.nn.ModuleList([
-                       ResnetBlock(dim_in, dim_out, time_emb_dim=dim),
-                       ResnetBlock(dim_out, dim_out, time_emb_dim=dim),
-                       Residual(Rezero(LinearAttention(dim_out))),
-                       Downsample(dim_out) if not is_last else torch.nn.Identity()]))
+        register_buffer('posterior_variance', posterior_variance)
 
-        mid_dim = dims[-1]
-        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=dim)
-        self.mid_attn = Residual(Rezero(LinearAttention(mid_dim)))
-        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=dim)
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            self.ups.append(torch.nn.ModuleList([
-                     ResnetBlock(dim_out * 2, dim_in, time_emb_dim=dim),
-                     ResnetBlock(dim_in, dim_in, time_emb_dim=dim),
-                     Residual(Rezero(LinearAttention(dim_in))),
-                     Upsample(dim_in)]))
-        self.final_block = Block(dim, dim)
-        self.final_conv = torch.nn.Conv2d(dim, 1, 1)
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-    def forward(self, x, mask, mu, t, spk=None):
-        if not isinstance(spk, type(None)):
-            s = self.spk_mlp(spk)
-        
-        t = self.time_pos_emb(t, scale=self.pe_scale)
-        t = self.mlp(t)
+        # calculate p2 reweighting
 
-        if self.n_spks < 2:
-            x = torch.stack([mu, x], 1)
-        else:
-            s = s.unsqueeze(-1).repeat(1, 1, x.shape[-1])
-            x = torch.stack([mu, x, s], 1)
-        mask = mask.unsqueeze(1)
+        register_buffer('p2_loss_weight',
+                        (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
-        hiddens = []
-        masks = [mask]
-        for resnet1, resnet2, attn, downsample in self.downs:
-            mask_down = masks[-1]
-            x = resnet1(x, mask_down, t)
-            x = resnet2(x, mask_down, t)
-            x = attn(x)
-            hiddens.append(x)
-            x = downsample(x * mask_down)
-            masks.append(mask_down[:, :, :, ::2])
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+                extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+                extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
 
-        masks = masks[:-1]
-        mask_mid = masks[-1]
-        x = self.mid_block1(x, mask_mid, t)
-        x = self.mid_attn(x)
-        x = self.mid_block2(x, mask_mid, t)
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+                (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+                extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
 
-        for resnet1, resnet2, attn, upsample in self.ups:
-            mask_up = masks.pop()
-            x = torch.cat((x, hiddens.pop()), dim=1)
-            x = resnet1(x, mask_up, t)
-            x = resnet2(x, mask_up, t)
-            x = attn(x)
-            x = upsample(x * mask_up)
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+                extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+                extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-        x = self.final_block(x, mask)
-        output = self.final_conv(x * mask)
+    def model_predictions(self, x, mask, mu, t, spk=None, clip_x_start=False):
+        model_output = self.model(x, mask, mu, t)
+        maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
 
-        return (output * mask).squeeze(1)
+        pred_noise = model_output
+        x_start = self.predict_start_from_noise(x, t, pred_noise)
+        x_start = maybe_clip(x_start)
 
+        return pred_noise, x_start
 
-def get_noise(t, beta_init, beta_term, cumulative=False):
-    if cumulative:
-        noise = beta_init*t + 0.5*(beta_term - beta_init)*(t**2)
-    else:
-        noise = beta_init + (beta_term - beta_init)*t
-    return noise
+    def p_mean_variance(self, x, t, x_self_cond=None, clip_denoised=True):
+        preds, x_start = self.model_predictions(x, t, x_self_cond)
 
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
 
-class Diffusion(BaseModule):
-    def __init__(self, n_feats, dim,
-                 n_spks=1, spk_emb_dim=64,
-                 beta_min=0.05, beta_max=20, pe_scale=1000):
-        super(Diffusion, self).__init__()
-        self.n_feats = n_feats
-        self.dim = dim
-        self.n_spks = n_spks
-        self.spk_emb_dim = spk_emb_dim
-        self.beta_min = beta_min
-        self.beta_max = beta_max
-        self.pe_scale = pe_scale
-        
-        self.estimator = GradLogPEstimator2d(dim, n_spks=n_spks,
-                                             spk_emb_dim=spk_emb_dim,
-                                             pe_scale=pe_scale)
-
-    def forward_diffusion(self, x0, mask, mu, t):
-        time = t.unsqueeze(-1).unsqueeze(-1)
-        cum_noise = get_noise(time, self.beta_min, self.beta_max, cumulative=True)
-        mean = x0*torch.exp(-0.5*cum_noise) + mu*(1.0 - torch.exp(-0.5*cum_noise))
-        variance = 1.0 - torch.exp(-cum_noise)
-        z = torch.randn(x0.shape, dtype=x0.dtype, device=x0.device, 
-                        requires_grad=False)
-        xt = mean + z * torch.sqrt(variance)
-        return xt * mask, z * mask
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x, t=t)
+        return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def reverse_diffusion(self, z, mask, mu, n_timesteps, stoc=False, spk=None):
-        h = 1.0 / n_timesteps
-        xt = z * mask
-        for i in range(n_timesteps):
-            t = (1.0 - (i + 0.5)*h) * torch.ones(z.shape[0], dtype=z.dtype, 
-                                                 device=z.device)
-            time = t.unsqueeze(-1).unsqueeze(-1)
-            noise_t = get_noise(time, self.beta_min, self.beta_max, 
-                                cumulative=False)
-            if stoc:  # adds stochastic term
-                dxt_det = 0.5 * (mu - xt) - self.estimator(xt, mask, mu, t, spk)
-                dxt_det = dxt_det * noise_t * h
-                dxt_stoc = torch.randn(z.shape, dtype=z.dtype, device=z.device,
-                                       requires_grad=False)
-                dxt_stoc = dxt_stoc * torch.sqrt(noise_t * h)
-                dxt = dxt_det + dxt_stoc
-            else:
-                dxt = 0.5 * (mu - xt - self.estimator(xt, mask, mu, t, spk))
-                dxt = dxt * noise_t * h
-            xt = (xt - dxt) * mask
-        return xt
+    def p_sample(self, x, t: int, x_self_cond=None, clip_denoised=True):
+        b, *_, device = *x.shape, x.device
+        batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x=x, t=batched_times, x_self_cond=x_self_cond,
+                                                                          clip_denoised=clip_denoised)
+        noise = torch.randn_like(x) if t > 0 else 0.  # no noise if t == 0
+        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
+        return pred_img, x_start
 
     @torch.no_grad()
-    def forward(self, z, mask, mu, n_timesteps, stoc=False, spk=None):
-        return self.reverse_diffusion(z, mask, mu, n_timesteps, stoc, spk)
+    def p_sample_loop(self, shape):
+        batch, device = shape[0], self.betas.device
 
-    def loss_t(self, x0, mask, mu, t, spk=None):
-        xt, z = self.forward_diffusion(x0, mask, mu, t)
-        time = t.unsqueeze(-1).unsqueeze(-1)
-        cum_noise = get_noise(time, self.beta_min, self.beta_max, cumulative=True)
-        noise_estimation = self.estimator(xt, mask, mu, t, spk)
-        noise_estimation *= torch.sqrt(1.0 - torch.exp(-cum_noise))
-        loss = torch.sum((noise_estimation + z)**2) / (torch.sum(mask)*self.n_feats)
-        return loss, xt
+        img = torch.randn(shape, device=device)
 
-    def compute_loss(self, x0, mask, mu, spk=None, offset=1e-5):
-        t = torch.rand(x0.shape[0], dtype=x0.dtype, device=x0.device,
-                       requires_grad=False)
-        t = torch.clamp(t, offset, 1.0 - offset)
-        return self.loss_t(x0, mask, mu, t, spk)
+        x_start = None
+
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, t, self_cond)
+        return img
+
+    @torch.no_grad()
+    def ddim_sample(self, mask, mu, clip_denoised=True):
+        batch, device, total_timesteps, sampling_timesteps, eta = mu.shape[0], self.betas.device, self.num_timesteps, \
+                                                                  self.sampling_timesteps, self.ddim_sampling_eta
+
+        times = torch.linspace(-1, total_timesteps - 1,
+                               steps=sampling_timesteps + 1)  # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        x = torch.randn(mu.shape, device=device)
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+            t = torch.full((batch,), time, device=device, dtype=torch.long)
+            mu = x_start if self.mu else None
+            pred_noise, x_start = self.model_predictions(x, mask, mu, t, clip_x_start=clip_denoised)
+
+            if time_next < 0:
+                x = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x)
+
+            x = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+        return x
+
+    @torch.no_grad()
+    def sample(self, mask, mu):
+        return self.ddim_sample(mask, mu)
+
+    @torch.no_grad()
+    def interpolate(self, x1, x2, t=None, lam=0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+
+        return img
+
+    def q_sample(self, x_start, t, noise=None):
+
+        return (
+                extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+                extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    @property
+    def loss_fn(self):
+        if self.loss_type == 'l1':
+            return F.l1_loss
+        elif self.loss_type == 'l2':
+            return F.mse_loss
+        else:
+            raise ValueError(f'invalid loss type {self.loss_type}')
+
+    def p_losses(self, x0, mask, mu, t, spk):
+        b, h, w = x0.shape
+        noise = torch.randn_like(x0)
+
+        # noise sample
+
+        x = self.q_sample(x_start=x0, t=t, noise=noise)
+
+        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
+        # and condition with unet with that
+        # this technique will slow down training by 25%, but seems to lower FID significantly
+
+        # predict and take gradient step
+
+        model_out = self.model(x, mask, mu, t, spk)
+
+        target = noise
+
+        loss = self.loss_fn(model_out, target, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+
+        loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+        return loss.mean()
+
+    def forward(self, x0, mask, mu, spk=None, offset=1e-5):
+
+        t = torch.randint(0, self.num_timesteps, (x0.shape[0],), device=x0.device).long()
+
+        return self.p_losses(x0, mask, mu, t, spk)
