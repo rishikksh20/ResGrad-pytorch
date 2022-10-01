@@ -19,10 +19,9 @@ estimator = GradLogPEstimator2d(dim, n_spks=n_spks,
 diff = GaussianDiffusion(estimator)
 
 
-mel_gt = torch.ones([2, 80, 100])
-mask = torch.zeros([2, 1, 100])
-mel_gen = torch.ones([2, 80, 100])
-t = torch.rand([2])
+mel_gt = torch.ones([2, 80, 100])   # Ground truth mel
+mask = torch.zeros([2, 1, 100])     # Mel mask
+mel_gen = torch.ones([2, 80, 100])  # Output of FS2 
 
 x0 = mel_gt - mel_gen
 
