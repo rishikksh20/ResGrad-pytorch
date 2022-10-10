@@ -57,12 +57,9 @@ class GaussianDiffusion(torch.nn.Module):
             ddim_sampling_eta=1.
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
-        assert not model.learned_sinusoidal_cond
+        
 
         self.model = model
-        self.channels = self.model.channels
-        self.self_condition = self.model.self_condition
 
 
         self.objective = objective
@@ -179,18 +176,6 @@ class GaussianDiffusion(torch.nn.Module):
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
-    @torch.no_grad()
-    def p_sample_loop(self, shape):
-        batch, device = shape[0], self.betas.device
-
-        img = torch.randn(shape, device=device)
-
-        x_start = None
-
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
-        return img
 
     @torch.no_grad()
     def ddim_sample(self, mask, mu, clip_denoised=True):
